@@ -7,29 +7,50 @@
 from __future__ import print_function
 import argparse
 import ConfigParser
+import datetime
 import logging
 import logging.config
 import os
 import re
 import shlex
-import sqlite3
 import subprocess
+import sqlalchemy
 import sys
-
+from sqlalchemy.ext.declarative import declarative_base
 
 LOGGER = logging.getLogger(__name__)
+
+Base = declarative_base()
+
+
+# sqlalchemy table definition
+class Item(Base):
+    __tablename__ = 'items'
+    id = sqlalchemy.Column(sqlalchemy.Integer, sqlalchemy.Sequence('user_id_seq'), primary_key=True)
+    path = sqlalchemy.Column(sqlalchemy.Binary())
+    time = sqlalchemy.Column(sqlalchemy.DateTime(timezone=True))  # UTC time
+    ignore = sqlalchemy.Column(sqlalchemy.Boolean, default=False)  # ignore (so it can be retrieved again)
+
+    def __repr__(self):
+        return "<Unit(id={s.id}, name={s.name}, time={s.time}>".format(s=self)
 
 
 def parse_config_file(conffile):
     cparser = ConfigParser.RawConfigParser()
     cparser.read(conffile)
-    global RSYNC_PASSWORD, RSYNC_PATH, LOGFILE, PIDFILE, DATABASE_FILE, UPLOAD_DIR
-    RSYNC_PASSWORD = cparser.get('dspace_upload', 'rsync_password')
-    RSYNC_PATH = cparser.get('dspace_upload', 'rsync_path')
-    LOGFILE = cparser.get('dspace_upload', 'logfile')
-    PIDFILE = cparser.get('dspace_upload', 'pidfile')
-    DATABASE_FILE = cparser.get('dspace_upload', 'database_file')
-    UPLOAD_DIR = cparser.get('dspace_upload', 'upload_dir')
+    global RSYNC_PASSWORD, RSYNC_PATH, LOGFILE, LOGLEVEL, PIDFILE, DATABASE_FILE, TRANSFER_SOURCE_DIR
+    section = 'dspace_retrieve'
+    RSYNC_PASSWORD = (cparser.has_option(section, 'rsync_password') and
+                      cparser.get(section, 'rsync_password') or
+                      "DUMMY")
+    RSYNC_PATH = cparser.get(section, 'rsync_path')
+    LOGFILE = cparser.get(section, 'logfile')
+    LOGLEVEL = (cparser.has_option(section, 'loglevel') and
+                cparser.get(section, 'loglevel') or
+                "INFO")
+    PIDFILE = cparser.get(section, 'pidfile')
+    DATABASE_FILE = cparser.get(section, 'dspace_retrieve_db_file')
+    TRANSFER_SOURCE_DIR = cparser.get(section, 'transfer_source_dir')
 
 
 def get_dspace_available_items():
@@ -37,7 +58,7 @@ def get_dspace_available_items():
     command = ['rsync',
                '-a',
                '--list-only',
-               '--exclude', '.*',  # Ignore hidden files
+               '--exclude=.*',  # Ignore hidden files
                RSYNC_PATH
                ]
 
@@ -52,7 +73,7 @@ def get_dspace_available_items():
     else:
         output = output.splitlines()
 
-        # example output of rsync --list-only 
+        # example output of rsync --list-only
         #
         # -rw-r--r--    118,919,773 2017/03/09 22:31:24 ITEM@2429-100.zip
         # -rw-r--r--     10,631,105 2016/11/30 08:23:35 ITEM@2429-10000.zip
@@ -60,13 +81,12 @@ def get_dspace_available_items():
         # -rw-r--r--     10,212,180 2016/11/29 10:21:49 ITEM@2429-10002.zip
         # -rw-r--r--     10,333,444 2016/11/29 16:20:38 ITEM@2429-10003.zip
 
-
         regex = r'^(?P<type>.)(?P<permissions>.{9}) +(?P<size>[\d,]+) (?P<timestamp>..../../.. ..:..:..) (?P<name>.*)$'
         p = re.compile(regex)
         matches = [p.match(e) for e in output]
         # First get list of files, items whose type (first char in each line output) is '-'
         files = [e.group('name') for e in matches
-                       if e and e.group('name') != '.' and e.group('type') == '-']
+                 if e and e.group('name') != '.' and e.group('type') == '-']
         LOGGER.debug('files in server: %s', len(files))
 
         # Now get ITEM@xxx-xxxx.zip entries
@@ -80,19 +100,21 @@ def get_dspace_available_items():
         return set(items)
 
 
-def get_dspace_uploaded_items():
-    conn = sqlite3.connect(DATABASE_FILE)
-    c = conn.cursor()
-    # query for all records in the table uploaded
-    c.execute('select * from uploaded')
-    # c is an iterator containing all the query results (one tuple per row)
-    # unpack each tuple, add to a list, and return as set
-    complete_set = set()
-    for row in c:
-        complete_set.add(row[0])
-    c.close()
-    conn.close()
-    return complete_set
+def get_retrieved_items(session):
+    # get all retrieved items with ignore=Flase
+    uploaded_items = session.query(Item).filter_by(ignore=False)
+    uploaded_set = set()
+    for i in uploaded_items:
+        uploaded_set.add(i.path)
+
+    return uploaded_set
+
+
+def add_retrieved_item(session, path, time):
+    new_item = Item(path=path, time=time)
+    session.add(new_item)
+    session.commit()
+    return
 
 
 def main(arguments):
@@ -132,7 +154,7 @@ def main(arguments):
         },
         'loggers': {
             '': {
-                'level': 'INFO',
+                'level': LOGLEVEL,
                 'handlers': ['console', 'file'],
             },
         },
@@ -154,14 +176,14 @@ def main(arguments):
     # if file was specified in the args, download the file
     if args.file:
         LOGGER.debug("Specified file: {}".format(args.file))
-        commstr = 'rsync -a {}{} {}'.format(RSYNC_PATH, args.file, UPLOAD_DIR)
+        commstr = 'rsync -a {}{} {}'.format(RSYNC_PATH, args.file, TRANSFER_SOURCE_DIR)
         LOGGER.debug('rsync command: {}'.format(commstr))
         env = os.environ.copy()
         env['RSYNC_PASSWORD'] = RSYNC_PASSWORD
         subprocess.check_call(shlex.split(commstr), env=env)
 
-        # assuming that when a file is specified in the args, it is for 
-        # debugging purposes so: 
+        # assuming that when a file is specified in the args, it is for
+        # debugging purposes so:
         #  - do not do check/add to database of uploaded items
         #  - do not check limit of maximum uploads
 
@@ -175,8 +197,8 @@ def main(arguments):
         # just allow max_upload_items at a time
         # Items are zip files like: ITEM@2429-10003.zip, ITEM@2429-10003.zip
         max_upload_items = 1
-        dirlist = os.listdir(UPLOAD_DIR)
-        LOGGER.debug("files in UPLOAD_DIR: {}".format(dirlist))
+        dirlist = os.listdir(TRANSFER_SOURCE_DIR)
+        LOGGER.debug("files in TRANSFER_SOURCE_DIR: {}".format(dirlist))
         regex = r'^ITEM@(\w+)-(\w+).zip'
         p = re.compile(regex)
         matches = [p.match(e) for e in dirlist]
@@ -188,22 +210,32 @@ def main(arguments):
         else:
             LOGGER.debug("Proceed to upload a new source...")
 
-        # fetch list of directories from dspace server
+        # check all exported items in dspace server
         available_set = get_dspace_available_items()
         available_list = sorted(available_set)
-        # LOGGER.debug('available list: %s', available_list)
+        LOGGER.debug('available list: %s', available_list)
         LOGGER.info('len(available_list): %s', len(available_list))
 
-        # check existing database of uploaded videos
-        uploaded_set = get_dspace_uploaded_items()
+        # Initialize  database
+        if not os.path.isfile(DATABASE_FILE):
+            # Create database file if it does not exist already
+            with open(DATABASE_FILE, "a"):
+                pass
+        engine = sqlalchemy.create_engine('sqlite:///{}'.format(DATABASE_FILE), echo=False)
+        Session = sqlalchemy.orm.sessionmaker(bind=engine)
+        Base.metadata.create_all(engine)
+        session = Session()
+
+        # check database for retrieved items
+        uploaded_set = get_retrieved_items(session)
         uploaded_list = sorted(uploaded_set)
-        # LOGGER.debug('uploaded list: %s', uploaded_list)
+        LOGGER.debug('uploaded list: %s', uploaded_list)
         LOGGER.info('len(uploaded_list): %s', len(uploaded_list))
 
-        # check how many pending directories are
+        # check pending items
         pending_set = available_set - uploaded_set
         pending_list = sorted(pending_set)
-        # LOGGER.debug('pending list: %s', pending_list)
+        LOGGER.debug('pending list: %s', pending_list)
         LOGGER.info('len(pending_list): %s', len(pending_list))
 
         # will pick up the first entry in the pending set, download files and arrange
@@ -211,12 +243,12 @@ def main(arguments):
         if pending_list:    # do only when list not empty
             LOGGER.debug('Item to download/upload: %s', pending_list[0])
 
-            # note that we are copying the zip file to a directory with the same name 
+            # copying the zip file to a directory (with the same name)
             # (to replace the 00_file_to_folder.py script in automation tools)
-            
+
             # first create temp dir (name starting with . so that automation tools can't see it yet
             # and transfers do not start by accident if the script was called by crontab for example)
-            temp_transfer_full_path = os.path.join(UPLOAD_DIR, "." + pending_list[0])
+            temp_transfer_full_path = os.path.join(TRANSFER_SOURCE_DIR, "." + pending_list[0])
             if not os.path.exists(temp_transfer_full_path):
                 LOGGER.debug('Creating directory: {}'.format(temp_transfer_full_path))
                 os.mkdir(temp_transfer_full_path)
@@ -229,28 +261,14 @@ def main(arguments):
             subprocess.check_call(shlex.split(commstr), env=env)
 
             # done with the copy, now rename the temp directory (same name as zip file)
-            transfer_full_path = os.path.join(UPLOAD_DIR, pending_list[0])
+            transfer_full_path = os.path.join(TRANSFER_SOURCE_DIR, pending_list[0])
             os.rename(temp_transfer_full_path, transfer_full_path)
 
-            # add an entry to the uploaded table of the database (if not already there)
-            # database schema is:
-            #   sqlite> .schema
-            #   CREATE TABLE uploaded(item TEXT);
+            # add an entry to the uploaded table of the database
+            add_retrieved_item(session, pending_list[0], datetime.datetime.utcnow())
+            LOGGER.info("{} added to retrieved items table".format(pending_list[0]))
 
-            conn = sqlite3.connect(DATABASE_FILE)
-            c = conn.cursor()
-            t = (pending_list[0],)
-            c.execute('select * from uploaded where item=?', t)
-            l = list(c)
-            if l:
-                LOGGER.debug("{} already in uploaded table".format(pending_list[0]))
-            else:
-                c.execute('insert into uploaded values (?)', t)
-                conn.commit()
-                c.close()
-                conn.close()
-                LOGGER.info("{} added to uploaded table".format(pending_list[0]))
-
+        session.close()
         os.remove(PIDFILE)
         return 0
 

@@ -1,0 +1,15 @@
+[dspace_retrieve]
+rsync_password = MYPASSWORD
+rsync_path = user@server.org::aipstore/
+logfile = /var/log/archivematica/automation-tools/dspace_retrieve.log
+loglevel = DEBUG
+pidfile = /var/archivematica/automation-tools/dspace_retrieve_pid.lck
+dspace_retrieve_db_file = /var/archivematica/automation-tools/dspace_retrieve.db
+transfer_source_dir = /var/archivematica/dspace_ready_to_ingest
+
+[dspace_delete]
+logfile = /var/log/archivematica/automation-tools/dspace_delete.log
+loglevel = DEBUG
+pidfile = /var/archivematica/automation-tools/dspace_delete_pid.lck
+automation_tools_db_file = /var/archivematica/automation-tools/transfers.db
+transfer_source_dir = /var/archivematica/dspace_ready_to_ingest

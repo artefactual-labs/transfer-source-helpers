@@ -16,18 +16,21 @@ import shutil
 import sqlite3
 import sys
 
-
 LOGGER = logging.getLogger(__name__)
 
 
 def parse_config_file(conffile):
     cparser = ConfigParser.RawConfigParser()
     cparser.read(conffile)
-    global LOGFILE, PIDFILE, AUTOMATION_TOOLS_DB_FILE, UPLOAD_DIR
-    LOGFILE = cparser.get('dspace_delete', 'logfile')
-    PIDFILE = cparser.get('dspace_delete', 'pidfile')
-    AUTOMATION_TOOLS_DB_FILE = cparser.get('dspace_delete', 'automation_tools_db_file')
-    UPLOAD_DIR = cparser.get('dspace_delete', 'upload_dir')
+    global LOGFILE, LOGLEVEL, PIDFILE, AUTOMATION_TOOLS_DB_FILE, TRANSFER_SOURCE_DIR
+    section = 'dspace_delete'
+    LOGFILE = cparser.get(section, 'logfile')
+    LOGLEVEL = (cparser.has_option(section, 'loglevel') and
+                cparser.get(section, 'loglevel') or
+                "INFO")
+    PIDFILE = cparser.get(section, 'pidfile')
+    AUTOMATION_TOOLS_DB_FILE = cparser.get(section, 'automation_tools_db_file')
+    TRANSFER_SOURCE_DIR = cparser.get(section, 'transfer_source_dir')
 
 
 def main(arguments):
@@ -67,7 +70,7 @@ def main(arguments):
         },
         'loggers': {
             '': {
-                'level': 'INFO',
+                'level': LOGLEVEL,
                 'handlers': ['console', 'file'],
             },
         },
@@ -87,7 +90,7 @@ def main(arguments):
         f.close()
 
     # get list of transfer sources in uploads directory
-    dirlist = os.listdir(UPLOAD_DIR)
+    dirlist = os.listdir(TRANSFER_SOURCE_DIR)
     LOGGER.debug("dirlist: {}".format(dirlist))
     regex = r'^ITEM@(\w+)-(\w+).zip'
     p = re.compile(regex)
@@ -106,13 +109,20 @@ def main(arguments):
     c = conn.cursor()
     for a in found:
         t = (a,)
-        c.execute('select count(*) from unit where path like ? and unit_type="ingest" and status="COMPLETE"', t)
+        # This query used to work in ubuntu 14.04 sqlite3 (3.8)
+        # but no longer works in 16.04 sqlite (3.11)
+        # presumably due to addition of SQLITE_LIKE_DOESNT_MATCH_BLOBS
+        # compile-time option:
+        # c.execute('select count(*) from unit where path like ? and unit_type="ingest" and status="COMPLETE"', t)
+        # need to add a cast to blob type:
+        c.execute('select count(*) from unit where cast(path as TEXT) like ? and unit_type="ingest" and status="COMPLETE"', t)
+
         # query should return a list containing a single tuple with the count value
         # i.e., it should be [(1,)] or [(0,)]
         count = list(c)[0][0]
         LOGGER.debug("query for {} completed ingest returned {} hits".format(a, count))
         if count == 1:
-            path_to_delete = os.path.join(UPLOAD_DIR, a)
+            path_to_delete = os.path.join(TRANSFER_SOURCE_DIR, a)
             LOGGER.info("Deleting {} from TS location".format(path_to_delete))
             # note that item to delete is a directory
             shutil.rmtree(path_to_delete)
